@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import b2
+import b2.api
+import b2.utils
+import b2.progress
+import b2.exception
+
+def find_unfinished_file(bucket, file_name, file_info):
+    for file_ in bucket.list_unfinished_large_files():
+        if file_.file_name == file_name and file_.file_info == file_info:
+            parts = list(bucket.list_parts(file_.file_id))
+            if parts:
+                return ( file_, dict([ (part.part_number,part) for part in parts ]) )
+    return (None, {})
+
+def upload_part( bucket, file_id, part_number, part_range, upload_source, finished_part ):
+    # Compute the SHA1 of the part
+    offset, content_length = part_range
+
+    print("part range:", offset, content_length)
+
+    upload_source.seek(offset)
+    sha1_sum = b2.utils.hex_sha1_of_stream(upload_source, content_length)
+
+    print("sha1checksum:", sha1_sum)
+
+    if finished_part:
+        if finished_part.content_length == content_length and finished_part.content_sha1 == sha1_sum:
+            logger.info("already uploaded part matches: skip upload")
+            return {"contentSha1":sha1_sum}
+        else:
+            logger.info("already uploaded part does not match: uploading")
+
+
+    upload_url = None
+    # Retry the upload as needed
+    exception_list = []
+    for _ in range(bucket.MAX_UPLOAD_ATTEMPTS):
+        # refresh upload data in every attempt to work around a "busy storage pod"
+        upload_url, upload_auth_token = bucket._get_upload_part_data(file_id)
+
+        part_progress_listener = utils.ProgressListener(content_length)
+
+        try:
+            upload_source.seek(offset)
+            range_stream = b2.progress.RangeOfInputStream(upload_source, offset, content_length)
+            input_stream = b2.progress.StreamWithProgress(range_stream, part_progress_listener)
+            response = bucket.api.raw_api.upload_part( upload_url, upload_auth_token, part_number, content_length, sha1_sum, input_stream )
+            assert sha1_sum == response['contentSha1']
+            bucket.api.account_info.put_large_file_upload_url(
+                file_id, upload_url, upload_auth_token
+            )
+            return response
+
+        except b2.exception.B2Error as e:
+            logger.exception('error when uploading, upload_url was %s', upload_url)
+            if not e.should_retry_upload():
+                raise
+            exception_list.append(e)
+            bucket.api.account_info.clear_bucket_upload_data(bucket.id_)
+
+        finally:
+            part_progress_listener.close()
+
+    raise MaxRetriesExceeded(bucket.MAX_UPLOAD_ATTEMPTS, exception_list)
+
+# TODO multithread uploading
+# TODO single upload if < n?
+
+import b2stream.utils as utils
+import b2stream.crypto as crypto
+
+import sys
+import json
+import logging
+import argparse
+import binascii
+import tempfile
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    parser = argparse.ArgumentParser(description='Store input data on B2')
+    parser.add_argument("bucket", help="Bucket's name")
+    parser.add_argument("filename", help="File's name")
+    parser.add_argument("--content-type", help="File's content type", default='application/octet-stream')
+    parser.add_argument("--file-info", help="File's metadata", type=json.loads, default={})
+    parser.add_argument("--data-size", help="File's part size in bytes", type=int, default=100<<20)
+    parser.add_argument("--iv-size", help="Init vector size in bit", type=int, default=12*8)
+    parser.add_argument("--tag-size", help="Authenticated tag size in bit", type=int, default=16*8)
+    args = parser.parse_args()
+
+    api = b2.api.B2Api()
+    bucket = [ b for b in api.list_buckets() if b.name == args.bucket ][0]
+
+    key,salt = crypto.derive_key()
+
+    args.file_info["iv_size"] = str(args.iv_size)
+    args.file_info["tag_size"] = str(args.tag_size)
+    args.file_info["data_size"] = str(args.data_size)
+    args.file_info["kdf_salt"] = binascii.hexlify(salt).decode('ascii')
+
+    unfinished_file,finished_parts = find_unfinished_file(bucket, args.filename, args.file_info)
+    logger.info("found %d already uploaded parts", len(finished_parts))
+    if not unfinished_file:
+        unfinished_file = bucket.start_large_file(args.filename, args.content_type, args.file_info)
+
+    file_id = unfinished_file.file_id
+
+    current_size = 0
+    total_size = 0
+    i = 0
+
+    current_file = tempfile.TemporaryFile("w+b")
+    part_sha1_array = []
+    while True:
+        b = sys.stdin.buffer.read(8192)
+        if b:
+            current_file.write(b)
+            current_size += len(b)
+            total_size += len(b)
+
+        if current_size > ( args.data_size ) or not b:
+            logger.info("encrypting part: %d %d %d" % (i+1,current_size,total_size))
+            (cipher_file,cipher_file_size) = crypto.encrypt_part(current_file, key, args.iv_size//8, args.tag_size//8)
+            current_file.close()
+            logger.info("uploading part: %d %d %d" % (i+1,current_size,total_size))
+            response = upload_part(bucket, file_id, i+1, (0,cipher_file_size), cipher_file, finished_parts.get(i+1))
+            logger.info("uploaded part: %s", json.dumps(response))
+            part_sha1_array.append(response['contentSha1'])
+            i += 1
+            current_size = 0
+            cipher_file.close()
+            current_file = tempfile.TemporaryFile("w+b")
+
+        if not b:
+            break
+
+
+    logger.info("all %d parts uploaded, total size:%d bytes. Finishing...", i, total_size)
+    response = api.session.finish_large_file(file_id, part_sha1_array)
+    logger.info("finished: %s", json.dumps(response))
+
+

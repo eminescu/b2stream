@@ -1,0 +1,51 @@
+#!/usr/bin/python3
+
+import b2
+import b2.api
+import b2.utils
+import b2.progress
+import b2.exception
+
+import sys
+import argparse
+import binascii
+
+import b2stream.utils as utils
+import b2stream.crypto as crypto
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Output data stored on B2')
+    parser.add_argument("bucket", help="Bucket's name")
+    parser.add_argument("filename", help="File's name")
+    parser.add_argument("--ignore-invalid-tag", help="Keep going if authenticated tag is invalid", action="store_true", default=False)
+    args = parser.parse_args()
+
+    api = b2.api.B2Api()
+    bucket = [ b for b in api.list_buckets() if b.name == args.bucket ][0]
+
+    url = api.account_info.get_download_url() + '/file/' + args.bucket + '/' + b2.utils.b2_url_encode(args.filename)
+
+    with api.raw_api.b2_http.get_content(url, {'Authorization':api.account_info.get_account_auth_token()}) as response:
+        info = response.headers
+
+        file_id = info['x-bz-file-id']
+        file_name = info['x-bz-file-name']
+        content_type = info['content-type']
+        content_length = int(info['content-length'])
+        content_sha1 = info['x-bz-content-sha1']
+        file_info = dict((k[10:], info[k]) for k in info if k.startswith('x-bz-info-'))
+
+        with utils.DownloadBar('Downloading', max=content_length) as bar:
+
+            for chunk in crypto.decrypt(
+              response.raw,
+              crypto.derive_key( binascii.unhexlify(file_info["kdf_salt"]) )[0],
+              int(file_info["iv_size"])//8,
+              int(file_info["tag_size"])//8,
+              content_sha1,
+              args.ignore_invalid_tag
+              ):
+                bar.next(len(chunk))
+                sys.stdout.buffer.write(chunk)
+
+
