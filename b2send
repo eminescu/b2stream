@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 import b2
 import b2.api
@@ -40,7 +40,7 @@ if __name__ == "__main__":
             for chunk in crypto.decrypt(
               response.raw,
               crypto.derive_key( binascii.unhexlify(file_info["kdf_salt"]) )[0],
-              int(file_info["iv_size"])//8,
+              binascii.unhexlify(file_info["iv"]),
               int(file_info["tag_size"])//8,
               content_sha1,
               args.ignore_invalid_tag

@@ -19,40 +19,48 @@ def derive_key(salt=None):
     )
     return ( kdf.derive(getpass.getpass().encode("utf-8")), salt )
 
+"""
+Encrypted part structure:
+---------------
+|0xB2
+|version (2byte)
+|authenticated tag (tag_size)
+|data_size (64bit little-endian long long)
+|data
+--------------
+"""
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.exceptions import InvalidTag
 import struct
 import hashlib
 import binascii
 import sys
-def decrypt(source, key, iv_size, tag_size, content_sha1, ignore_invalid_tag):
-    """
-    encrypt file in parts, each part is:
-    iv (iv_size)
-    authenticated tag (tag_size)
-    data_size (64bit little-endian long long)
-    data
-    """
+def decrypt(source, key, iv, tag_size, content_sha1, ignore_invalid_tag):
     digest = hashlib.sha1()
+    i = 0
     while True:
-        iv = source.read(iv_size)
+        header = source.read(3)
         tag = source.read(tag_size)
         #tag = b'\x56' + tag[1:]
 
-        if not iv:
+        if not header:
             if content_sha1 != 'none' and digest.hexdigest() != content_sha1:
                 raise Exception("SHA1 checksum mismatch")
             return
 
-        print("iv:", binascii.hexlify(iv), iv_size, file=sys.stderr)
+        part_iv = increment_iv(iv,i)
+
+        print("part:", i+1, file=sys.stderr)
+        print("iv:", binascii.hexlify(part_iv), file=sys.stderr)
         print("tag:", binascii.hexlify(tag[0:tag_size]), tag_size, file=sys.stderr)
 
-        digest.update(iv)
+        digest.update(header)
         digest.update(tag)
 
         decryptor = Cipher(
             algorithms.AES(key),
-            modes.GCM(iv, tag, tag_size),
+            modes.GCM(part_iv, tag, tag_size),
             backend=backend
         ).decryptor()
 
@@ -76,22 +84,20 @@ def decrypt(source, key, iv_size, tag_size, content_sha1, ignore_invalid_tag):
             if not ignore_invalid_tag:
                 raise
 
+        i += 1
+
+def generate_iv(iv_size):
+    return os.urandom(iv_size)
+
+def increment_iv(iv, n):
+    return (int.from_bytes(iv,'big')+n).to_bytes(len(iv),'big',signed=False)
+
 import tempfile
-def encrypt_part( upload_source, key, iv_size, tag_size ):
-    """
-    encrypt file in parts, each part is:
-    ---------------
-    |iv (iv_size)
-    |authenticated tag (tag_size)
-    |data_size (64bit little-endian long long)
-    |data
-    --------------
-    """
+def encrypt_part( upload_source, key, iv, tag_size ):
     cipher_file = tempfile.TemporaryFile("w+b")
 
-    # write iv
-    iv = os.urandom(iv_size)
-    cipher_file.write(iv)
+    # write header + version
+    cipher_file.write(b'\xB2\x00\x01')
 
     encryptor = Cipher(
         algorithms.AES(key),
@@ -115,15 +121,15 @@ def encrypt_part( upload_source, key, iv_size, tag_size ):
             break
 
     size = cipher_file.tell()
-    data_size = size - iv_size - tag_size - 8
+    data_size = upload_source.tell()
 
-    print("iv:", binascii.hexlify(iv), iv_size)
+    print("iv:", binascii.hexlify(iv))
     print("tag:", binascii.hexlify(encryptor.tag[0:tag_size]), tag_size)
     print("file size:", size)
     print("data size:", data_size)
 
     # write tag
-    cipher_file.seek(iv_size)
+    cipher_file.seek(3)
     cipher_file.write(encryptor.tag[0:tag_size])
 
     # write data size

@@ -6,9 +6,11 @@ import b2.utils
 import b2.progress
 import b2.exception
 
-def find_unfinished_file(bucket, file_name, file_info):
+import b2stream.utils as utils
+def find_unfinished_file(bucket, file_name, file_info, ignore_keys):
+    filtered_file_info = utils.filter_dict(file_info, ignore_keys)
     for file_ in bucket.list_unfinished_large_files():
-        if file_.file_name == file_name and file_.file_info == file_info:
+        if file_.file_name == file_name and utils.filter_dict(file_.file_info, ignore_keys) == filtered_file_info:
             parts = list(bucket.list_parts(file_.file_id))
             if parts:
                 return ( file_, dict([ (part.part_number,part) for part in parts ]) )
@@ -68,7 +70,6 @@ def upload_part( bucket, file_id, part_number, part_range, upload_source, finish
 # TODO multithread uploading
 # TODO single upload if < n?
 
-import b2stream.utils as utils
 import b2stream.crypto as crypto
 
 import sys
@@ -94,16 +95,20 @@ if __name__ == "__main__":
     api = b2.api.B2Api()
     bucket = [ b for b in api.list_buckets() if b.name == args.bucket ][0]
 
-    key,salt = crypto.derive_key()
-
-    args.file_info["iv_size"] = str(args.iv_size)
-    args.file_info["tag_size"] = str(args.tag_size)
-    args.file_info["data_size"] = str(args.data_size)
-    args.file_info["kdf_salt"] = binascii.hexlify(salt).decode('ascii')
-
-    unfinished_file,finished_parts = find_unfinished_file(bucket, args.filename, args.file_info)
+    unfinished_file,finished_parts = find_unfinished_file(bucket, args.filename, args.file_info, {'tag_size', 'data_size', 'iv','kdf_salt'})
     logger.info("found %d already uploaded parts", len(finished_parts))
-    if not unfinished_file:
+    if unfinished_file:
+        args.tag_size = int( unfinished_file.file_info["tag_size"])
+        args.data_size = int( unfinished_file.file_info["data_size"])
+        key,salt = crypto.derive_key(binascii.unhexlify(unfinished_file.file_info["kdf_salt"]))
+        iv = binascii.unhexlify(unfinished_file.file_info["iv"]) 
+    else:
+        key,salt = crypto.derive_key()
+        iv = crypto.generate_iv(args.iv_size)
+        args.file_info["tag_size"] = str(args.tag_size)
+        args.file_info["data_size"] = str(args.data_size)
+        args.file_info["iv"] = binascii.hexlify(iv).decode('ascii')
+        args.file_info["kdf_salt"] = binascii.hexlify(salt).decode('ascii')
         unfinished_file = bucket.start_large_file(args.filename, args.content_type, args.file_info)
 
     file_id = unfinished_file.file_id
@@ -123,7 +128,7 @@ if __name__ == "__main__":
 
         if current_size > ( args.data_size ) or not b:
             logger.info("encrypting part: %d %d %d" % (i+1,current_size,total_size))
-            (cipher_file,cipher_file_size) = crypto.encrypt_part(current_file, key, args.iv_size//8, args.tag_size//8)
+            (cipher_file,cipher_file_size) = crypto.encrypt_part(current_file, key, crypto.increment_iv(iv,i), args.tag_size//8)
             current_file.close()
             logger.info("uploading part: %d %d %d" % (i+1,current_size,total_size))
             response = upload_part(bucket, file_id, i+1, (0,cipher_file_size), cipher_file, finished_parts.get(i+1))

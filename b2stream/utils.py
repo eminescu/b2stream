@@ -6,6 +6,9 @@ def sizeof_fmt(num, suffix='B'):
         num /= 1024.0
     return "%.1f%s%s" % (num, 'Yi', suffix)
 
+def filter_dict(d, ignore_keys):
+    return { k: d[k] for k in d if not k in ignore_keys }
+
 from progress.bar import Bar
 class DownloadBar(Bar):
     suffix = '%(hindex)9s %(percent)5.1f%%'
